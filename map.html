@@ -1,0 +1,44 @@
+
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Worked Cells Viewer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>html,body,#map{height:100%;margin:0;padding:0}</style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map').setView([0,0], 2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+
+    // Replace with your payload or supply via fetch body
+    fetch('http://127.0.0.1:8000/visualize', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        records:[
+          {x:0,y:0,speed_kmh:5,engine_on:true,pto_on:true},
+          {x:10,y:0,speed_kmh:5,engine_on:true,pto_on:true},
+          {x:20,y:0,speed_kmh:5,engine_on:true,pto_on:true},
+          {x:0,y:3,speed_kmh:5,engine_on:true,pto_on:true},
+          {x:10,y:3,speed_kmh:5,engine_on:true,pto_on:true},
+          {x:20,y:3,speed_kmh:5,engine_on:true,pto_on:true}
+        ],
+        config:{implement_width_m:4.0,min_speed_kmh:2.0,grid_cell_size_m:1.0}
+      })
+    })
+    .then(r=>r.json())
+    .then(geojson=>{
+      const layer = L.geoJSON(geojson,{style:{color:'#0077cc',weight:1,fillOpacity:0.4}});
+      layer.addTo(map);
+      map.fitBounds(layer.getBounds());
+      
+    })
+    .catch(e=>console.error(e));
+  </script>
+</body>
+</html>
