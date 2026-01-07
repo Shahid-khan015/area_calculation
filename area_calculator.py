@@ -74,26 +74,88 @@ def gps_to_planar(lat: float, lon: float,
 # =============================================================================
 
 def smooth_planar_points(points: List[PlanarPoint], window: int = 3) -> List[PlanarPoint]:
-    if len(points) < window:
+    """
+    Smooth planar points using exponential weighted moving average (Kalman-like).
+    
+    More responsive than simple moving average while still filtering noise.
+    Alpha=0.3 gives good balance between responsiveness and smoothing.
+    """
+    if len(points) < 2:
         return points
 
-    smoothed = []
-    for i in range(len(points)):
-        xs, ys = [], []
-        for j in range(max(0, i - window), min(len(points), i + window + 1)):
-            xs.append(points[j].x)
-            ys.append(points[j].y)
+    alpha = 0.3  # Smoothing factor (0 = max smoothing, 1 = no smoothing)
+    smoothed = [points[0]]  # Keep first point as-is
 
+    for i in range(1, len(points)):
+        prev_smooth = smoothed[-1]
+        curr = points[i]
+        
+        # Exponential weighted moving average
+        new_x = alpha * curr.x + (1 - alpha) * prev_smooth.x
+        new_y = alpha * curr.y + (1 - alpha) * prev_smooth.y
+        
         smoothed.append(
             PlanarPoint(
-                x=sum(xs) / len(xs),
-                y=sum(ys) / len(ys),
-                speed_kmh=points[i].speed_kmh,
-                engine_on=points[i].engine_on,
-                pto_on=points[i].pto_on,
+                x=new_x,
+                y=new_y,
+                speed_kmh=curr.speed_kmh,  # Keep original speed
+                engine_on=curr.engine_on,
+                pto_on=curr.pto_on,
             )
         )
+    
     return smoothed
+
+
+def deduplicate_points(points: List[PlanarPoint], min_distance_m: float = 0.1) -> List[PlanarPoint]:
+    """
+    Remove consecutive points that are closer than min_distance_m.
+    These are typically duplicate GPS readings or noise spikes.
+    
+    Args:
+        points: Input points
+        min_distance_m: Minimum distance to keep a point (default 0.1m)
+    
+    Returns:
+        Deduplicated points
+    """
+    if len(points) < 2:
+        return points
+    
+    deduplicated = [points[0]]
+    
+    for i in range(1, len(points)):
+        curr = points[i]
+        last = deduplicated[-1]
+        
+        distance = math.hypot(curr.x - last.x, curr.y - last.y)
+        
+        if distance >= min_distance_m:
+            deduplicated.append(curr)
+    
+    return deduplicated
+
+
+def validate_segment_velocity(p1: PlanarPoint, p2: PlanarPoint, 
+                              max_accel_kmh_per_point: float = 5.0) -> bool:
+    """
+    Check if segment velocity change is realistic.
+    Rejects segments with unrealistic acceleration (likely GPS jumps).
+    
+    Args:
+        p1, p2: Consecutive points
+        max_accel_kmh_per_point: Max realistic speed change between points
+    
+    Returns:
+        True if segment is valid, False if it's an acceleration anomaly
+    """
+    speed_diff = abs(p2.speed_kmh - p1.speed_kmh)
+    
+    # If speed jumps too much, it's likely a GPS error, not real acceleration
+    if speed_diff > max_accel_kmh_per_point:
+        return False
+    
+    return True
 
 
 def separate_trajectories_by_speed(points: List[PlanarPoint],
@@ -132,61 +194,79 @@ def calculate_quality_metrics(valid_points: List[PlanarPoint],
     """
     Calculate GPS quality score and estimated error bounds.
     
-    Quality factors:
-    1. Data density: points per 100m of travel
-    2. Working trajectory ratio: % of points at working speed
-    3. Speed consistency: std dev of working speeds
-    4. GPS fix confidence: lower repositioning ratio = better confidence in working area
+    Improved metrics:
+    1. Data density: points per 100m (min 10 for good coverage)
+    2. Trajectory consistency: low std dev of speeds = reliable work
+    3. Segment smoothness: low heading changes = clean path
+    4. Coverage completeness: ratio of working to total points
     
     Returns:
         (quality_score: 0.0-1.0, estimated_error_m2: ±meters²)
     """
     if not working_points or not valid_points:
-        return 0.0, area_m2 * 0.5  # Low confidence
+        return 0.0, area_m2 * 0.5
     
-    # Factor 1: Data density (normalized)
+    # Factor 1: Data density
     total_distance = 0.0
     for i in range(len(working_points) - 1):
         dx = working_points[i + 1].x - working_points[i].x
         dy = working_points[i + 1].y - working_points[i].y
         total_distance += math.hypot(dx, dy)
     
-    points_per_100m = (len(working_points) / max(total_distance, 100.0)) * 100.0
-    density_score = min(points_per_100m / 20.0, 1.0)  # 20+ points per 100m = perfect
+    total_distance = max(total_distance, 100.0)  # Normalize to 100m
+    points_per_100m = (len(working_points) / total_distance) * 100.0
+    density_score = min(points_per_100m / 10.0, 1.0)  # 10+ pts/100m = perfect
     
-    # Factor 2: Working trajectory ratio
-    working_ratio = len(working_points) / max(len(valid_points), 1)
-    working_ratio_score = min(working_ratio, 1.0)
-    
-    # Factor 3: Speed consistency in working trajectory
+    # Factor 2: Speed consistency (low variance = reliable work)
     if len(working_points) > 1:
         working_speeds = [p.speed_kmh for p in working_points]
         mean_speed = sum(working_speeds) / len(working_speeds)
-        variance = sum((s - mean_speed) ** 2 for s in working_speeds) / len(working_speeds)
-        std_dev = math.sqrt(variance)
-        speed_consistency = max(1.0 - (std_dev / max(mean_speed, 0.1)), 0.0)
+        
+        if mean_speed > 0.1:
+            variance = sum((s - mean_speed) ** 2 for s in working_speeds) / len(working_speeds)
+            std_dev = math.sqrt(variance)
+            coeff_variation = std_dev / mean_speed  # Normalized std dev
+            speed_consistency = max(1.0 - coeff_variation, 0.0)
+        else:
+            speed_consistency = 0.5
     else:
         speed_consistency = 0.5
     
-    # Factor 4: Repositioning filtering confidence
-    repositioning_ratio = repositioning_count / max(len(valid_points), 1)
-    repositioning_score = 1.0 - min(repositioning_ratio, 1.0)
+    # Factor 3: Coverage completeness
+    working_ratio = len(working_points) / max(len(valid_points), 1)
+    coverage_score = working_ratio
+    
+    # Factor 4: Path smoothness (heading stability = well-planned field work)
+    heading_changes = []
+    for i in range(1, len(working_points) - 1):
+        h1 = heading(working_points[i - 1], working_points[i])
+        h2 = heading(working_points[i], working_points[i + 1])
+        diff = abs(h2 - h1)
+        diff = min(diff, 2 * math.pi - diff)
+        heading_changes.append(diff)
+    
+    if heading_changes:
+        mean_heading_change = sum(heading_changes) / len(heading_changes)
+        smoothness = max(1.0 - (mean_heading_change / math.pi), 0.0)  # 0=random, 1=straight
+    else:
+        smoothness = 0.8
     
     # Combined quality score (weighted average)
     quality_score = (
         density_score * 0.25 +
-        working_ratio_score * 0.30 +
         speed_consistency * 0.25 +
-        repositioning_score * 0.20
+        coverage_score * 0.25 +
+        smoothness * 0.25
     )
     
-    # Estimated error based on quality
-    # Assume standard GPS error ±5m for position, scales with data quality
-    gps_position_error_m = 5.0
-    implement_width_error_m = 0.5
+    # Estimated error based on quality and area size
+    # Standard GPS horizontal accuracy: ±5m
+    # Implement width measurement error: ±0.5m
+    # Both scale inversely with quality
+    base_error_m = 5.0 * (1.0 - quality_score)
     
-    base_error = (gps_position_error_m + implement_width_error_m) * (1.0 - quality_score)
-    estimated_error_m2 = base_error * math.sqrt(area_m2 / 100.0)
+    # Error grows with square root of area (coverage uncertainty)
+    estimated_error_m2 = base_error_m * math.sqrt(area_m2 / 100.0)
     
     return quality_score, estimated_error_m2
 
@@ -197,9 +277,11 @@ def filter_and_project(records: List[SensorRecord],
     """
     Filter records by work criteria (engine ON, PTO ON, adequate speed).
     Project to planar coordinates.
-    Apply heading jitter detection to remove GPS noise BEFORE smoothing.
+    Deduplicate very close points.
+    Detect and remove heading jitter (GPS noise).
+    Smooth remaining clean points with Kalman-like filter.
     
-    Returns clean, jitter-filtered planar points (NOT yet smoothed).
+    Returns clean, validated planar points.
     """
     valid: List[PlanarPoint] = []
     origin_lat = origin_lon = None
@@ -215,22 +297,32 @@ def filter_and_project(records: List[SensorRecord],
         x, y = gps_to_planar(r.latitude, r.longitude, origin_lat, origin_lon)
         valid.append(PlanarPoint(x, y, r.speed_kmh, r.engine_on, r.pto_on))
 
-    # Apply heading jitter detection to remove GPS noise
-    # Only check interior points (not endpoints)
+    print(f"DEBUG: Raw valid points: {len(valid)}")
+    
+    # Step 1: Remove duplicate/very close points (noise spikes)
+    valid = deduplicate_points(valid, min_distance_m=0.1)
+    print(f"DEBUG: After deduplication: {len(valid)} points")
+
+    # Step 2: Apply heading jitter detection to remove GPS noise
     if len(valid) < 3:
         return valid
     
     jitter_filtered = [valid[0]]  # Keep first point
     
     for i in range(1, len(valid) - 1):
-        # Check if point i is heading jitter
+        # Only keep point i if it's NOT heading jitter
         if not is_heading_jitter(valid[i - 1], valid[i], valid[i + 1]):
             jitter_filtered.append(valid[i])
     
     jitter_filtered.append(valid[-1])  # Keep last point
+    print(f"DEBUG: After jitter filtering: {len(jitter_filtered)} points")
     
-    # NOW smooth the clean points (much fewer of them, so smoothing won't collapse them)
-    return smooth_planar_points(jitter_filtered, window=3)
+    # Step 3: Smooth clean points with Kalman-like filter
+    smoothed = smooth_planar_points(jitter_filtered)
+    print(f"DEBUG: After smoothing: {len(smoothed)} points")
+    
+    return smoothed
+
 
 
 
@@ -255,31 +347,74 @@ def is_heading_jitter(p_prev: PlanarPoint,
     return diff > max_angle_rad
 
 
-def build_work_polygons(points, implement_width_m):
-    polygons = []
+def build_work_polygons(points: List[PlanarPoint], implement_width_m: float) -> List[Polygon]:
+    """
+    Build work strip polygons from trajectory points.
+    
+    Adaptive thresholds:
+    - min_distance: Depends on implement width and GPS noise levels
+    - max_distance: Rejects unrealistic GPS jumps
+    - velocity validation: Rejects segments with impossible acceleration
+    
+    High-resolution buffer for smooth geometry.
+    """
+    polygons: List[Polygon] = []
 
+    if len(points) < 2:
+        return polygons
+
+    # Adaptive distance thresholds
+    # Minimum: at least 1/4 implement width (to capture narrow strips)
+    # Maximum: realistic field pass distance (usually < 100m)
+    min_distance = max(0.5, implement_width_m * 0.25)
+    max_distance = 100.0  # Unrealistic GPS jump threshold
+    
+    skipped_count = 0
+    accepted_count = 0
+    
     for i in range(len(points) - 1):
-        p1, p2 = points[i], points[i + 1]
+        p1 = points[i]
+        p2 = points[i + 1]
 
         distance = math.hypot(p2.x - p1.x, p2.y - p1.y)
 
-        if distance < max(0.5, implement_width_m * 0.25):
+        # 1️⃣ Reject if too short (GPS noise)
+        if distance < min_distance:
+            skipped_count += 1
             continue
 
-        if distance > 25.0:
+        # 2️⃣ Reject if too long (GPS jump/teleportation)
+        if distance > max_distance:
+            skipped_count += 1
             continue
 
+        # 3️⃣ Reject if velocity doesn't make sense
+        if not validate_segment_velocity(p1, p2):
+            skipped_count += 1
+            continue
+
+        # 4️⃣ Reject if heading jitter (last check for outliers)
+        if i > 0 and i < len(points) - 2:
+            if is_heading_jitter(points[i - 1], p1, p2, max_angle_rad=math.radians(60)):
+                skipped_count += 1
+                continue
+
+        # 5️⃣ Valid strip - create with high-resolution buffer
         line = LineString([(p1.x, p1.y), (p2.x, p2.y)])
 
+        # High resolution (64 points per quadrant) for smooth boundaries
+        # Bevel join for sharp corners, flat cap for clean line ends
         strip = line.buffer(
             implement_width_m / 2.0,
-            resolution=32,
-            cap_style=1,
-            join_style=1
+            resolution=64,
+            cap_style=1,  # flat cap
+            join_style=2  # bevel join
         )
 
         polygons.append(strip)
+        accepted_count += 1
 
+    print(f"DEBUG: Segments: {accepted_count} accepted, {skipped_count} rejected")
     return polygons
 
 
