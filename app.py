@@ -92,53 +92,41 @@ def calculate(req: CalculateRequest):
             for r in req.records
         ]
 
-        # Use improved calculation with speed-based separation and quality metrics
-        from area_calculator import separate_trajectories_by_speed, calculate_quality_metrics
+        # Build strips directly from planar points (no GPS projection needed)
+        from area_calculator import build_work_polygons
         from shapely.geometry import Polygon
         from shapely.ops import unary_union
 
-        # Separate working vs repositioning trajectories
-        working_points, repositioning_points = separate_trajectories_by_speed(planar_points, 15.0)
+        strips = build_work_polygons(planar_points, config.implement_width_m)
 
-        if len(working_points) < 2:
+        if len(strips) < 1:
             result = type('Result', (), {
                 'total_area_m2': 0.0,
                 'total_area_ha': 0.0,
                 'geometry': Polygon(),
                 'quality_score': 0.0,
                 'estimated_error_m2': 0.0,
-                'working_trajectory_points': len(working_points),
-                'repositioning_points_filtered': len(repositioning_points)
+                'working_trajectory_points': len(planar_points),
+                'repositioning_points_filtered': 0
             })()
         else:
-            from area_calculator import build_work_polygons
-            strips = build_work_polygons(working_points, config.implement_width_m)
-            merged = unary_union(strips) if strips else None
-
-            if merged:
-                area_m2 = merged.area
-                quality_score, estimated_error_m2 = calculate_quality_metrics(
-                    planar_points, working_points, len(repositioning_points), area_m2
-                )
-                result = type('Result', (), {
-                    'total_area_m2': area_m2,
-                    'total_area_ha': area_m2 / 10000.0,
-                    'geometry': merged,
-                    'quality_score': quality_score,
-                    'estimated_error_m2': estimated_error_m2,
-                    'working_trajectory_points': len(working_points),
-                    'repositioning_points_filtered': len(repositioning_points)
-                })()
-            else:
-                result = type('Result', (), {
-                    'total_area_m2': 0.0,
-                    'total_area_ha': 0.0,
-                    'geometry': Polygon(),
-                    'quality_score': 0.0,
-                    'estimated_error_m2': 0.0,
-                    'working_trajectory_points': len(working_points),
-                    'repositioning_points_filtered': len(repositioning_points)
-                })()
+            merged = unary_union(strips)
+            area_m2 = merged.area
+            
+            from area_calculator import calculate_quality_metrics
+            quality_score, estimated_error_m2 = calculate_quality_metrics(
+                planar_points, planar_points, 0, area_m2
+            )
+            
+            result = type('Result', (), {
+                'total_area_m2': area_m2,
+                'total_area_ha': area_m2 / 10000.0,
+                'geometry': merged,
+                'quality_score': quality_score,
+                'estimated_error_m2': estimated_error_m2,
+                'working_trajectory_points': len(planar_points),
+                'repositioning_points_filtered': 0
+            })()
 
     elif all_gps:
         sensor_records = [

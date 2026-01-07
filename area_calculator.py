@@ -100,15 +100,14 @@ def separate_trajectories_by_speed(points: List[PlanarPoint],
                                     repositioning_speed_kmh: float = 15.0
                                     ) -> Tuple[List[PlanarPoint], List[PlanarPoint]]:
     """
-    Separate working trajectory from repositioning trajectory based on speed threshold.
+    OPTIONAL: Separate working trajectory from repositioning trajectory.
     
-    Real-world patterns:
-    - Working speed: 2-12 km/h (actively applying implement)
-    - Repositioning: > repositioning_speed_kmh (moving to next field/headland)
+    NOTE: All points here already have PTO ON, so they are "working" by definition.
+    This function is kept for backward compatibility but has limited utility
+    since PTO-OFF points are already filtered in filter_and_project().
     
-    Args:
-        points: All valid planar points
-        repositioning_speed_kmh: Speed threshold above which points are considered repositioning
+    Use this only if you want to further subdivide by speed (e.g., identify
+    periods of slow careful work vs faster field traversal).
     
     Returns:
         (working_points, repositioning_points) — two separate trajectory lists
@@ -195,7 +194,13 @@ def calculate_quality_metrics(valid_points: List[PlanarPoint],
 
 def filter_and_project(records: List[SensorRecord],
                        min_speed: float) -> List[PlanarPoint]:
-
+    """
+    Filter records by work criteria (engine ON, PTO ON, adequate speed).
+    Project to planar coordinates.
+    Apply heading jitter detection to remove GPS noise BEFORE smoothing.
+    
+    Returns clean, jitter-filtered planar points (NOT yet smoothed).
+    """
     valid: List[PlanarPoint] = []
     origin_lat = origin_lon = None
 
@@ -210,7 +215,23 @@ def filter_and_project(records: List[SensorRecord],
         x, y = gps_to_planar(r.latitude, r.longitude, origin_lat, origin_lon)
         valid.append(PlanarPoint(x, y, r.speed_kmh, r.engine_on, r.pto_on))
 
-    return smooth_planar_points(valid)
+    # Apply heading jitter detection to remove GPS noise
+    # Only check interior points (not endpoints)
+    if len(valid) < 3:
+        return valid
+    
+    jitter_filtered = [valid[0]]  # Keep first point
+    
+    for i in range(1, len(valid) - 1):
+        # Check if point i is heading jitter
+        if not is_heading_jitter(valid[i - 1], valid[i], valid[i + 1]):
+            jitter_filtered.append(valid[i])
+    
+    jitter_filtered.append(valid[-1])  # Keep last point
+    
+    # NOW smooth the clean points (much fewer of them, so smoothing won't collapse them)
+    return smooth_planar_points(jitter_filtered, window=3)
+
 
 
 # =============================================================================
@@ -273,62 +294,70 @@ def calculate_worked_area(records: List[SensorRecord],
                           field_boundary: Optional[Polygon] = None,
                           repositioning_speed_kmh: float = 15.0
                           ) -> CalculationResult:
+    """
+    Calculate worked area with diagnostics.
+    
+    Pipeline:
+    1. Filter by engine ON, PTO ON, speed >= min_speed_kmh
+    2. Project to planar coordinates
+    3. Detect and remove heading jitter (GPS noise)
+    4. Smooth remaining clean points
+    5. Build work strips
+    6. Union strips (remove overlaps)
+    7. Optionally clip to field boundary
+    8. Calculate quality metrics
+    """
 
     valid_points = filter_and_project(records, config.min_speed_kmh)
+    
+    print(f"DEBUG: After filter + jitter removal + smoothing: {len(valid_points)} points")
 
     if len(valid_points) < 2:
+        print("ERROR: Insufficient valid points (need ≥ 2)")
         return CalculationResult(
             total_area_m2=0.0,
             total_area_ha=0.0,
             geometry=Polygon(),
             quality_score=0.0,
             estimated_error_m2=0.0,
-            working_trajectory_points=0,
+            working_trajectory_points=len(valid_points),
             repositioning_points_filtered=0
         )
 
-    # Separate working vs repositioning trajectories
-    working_points, repositioning_points = separate_trajectories_by_speed(
-        valid_points, repositioning_speed_kmh
-    )
-
-    # Core calculation uses only working-speed points
-    if len(working_points) < 2:
-        return CalculationResult(
-            total_area_m2=0.0,
-            total_area_ha=0.0,
-            geometry=Polygon(),
-            quality_score=0.0,
-            estimated_error_m2=0.0,
-            working_trajectory_points=len(working_points),
-            repositioning_points_filtered=len(repositioning_points)
-        )
-
-    strips = build_work_polygons(working_points, config.implement_width_m)
+    # Build work strips from ALL valid points (PTO already filtered)
+    strips = build_work_polygons(valid_points, config.implement_width_m)
+    
+    print(f"DEBUG: Generated {len(strips)} work strips")
 
     if not strips:
+        print("WARNING: No valid work strips generated. Check distance thresholds and heading jitter.")
         return CalculationResult(
             total_area_m2=0.0,
             total_area_ha=0.0,
             geometry=Polygon(),
             quality_score=0.0,
             estimated_error_m2=0.0,
-            working_trajectory_points=len(working_points),
-            repositioning_points_filtered=len(repositioning_points)
+            working_trajectory_points=len(valid_points),
+            repositioning_points_filtered=0
         )
 
-    merged = unary_union(strips).buffer(0)
+    merged = unary_union(strips)
+    
+    print(f"DEBUG: Merged geometry area: {merged.area:.2f} m²")
 
     if field_boundary:
         merged = merged.intersection(field_boundary)
+        print(f"DEBUG: After field boundary clip: {merged.area:.2f} m²")
 
     total_area_m2 = merged.area
     total_area_ha = total_area_m2 / 10000.0
 
-    # Calculate quality metrics
+    # Calculate quality metrics based on data density and consistency
     quality_score, estimated_error_m2 = calculate_quality_metrics(
-        valid_points, working_points, len(repositioning_points), total_area_m2
+        valid_points, valid_points, 0, total_area_m2
     )
+
+    print(f"DEBUG: Quality score: {quality_score:.4f}, Error bounds: ±{estimated_error_m2:.2f} m²")
 
     return CalculationResult(
         total_area_m2=total_area_m2,
@@ -336,8 +365,8 @@ def calculate_worked_area(records: List[SensorRecord],
         geometry=merged,
         quality_score=quality_score,
         estimated_error_m2=estimated_error_m2,
-        working_trajectory_points=len(working_points),
-        repositioning_points_filtered=len(repositioning_points)
+        working_trajectory_points=len(valid_points),
+        repositioning_points_filtered=0
     )
 
 
