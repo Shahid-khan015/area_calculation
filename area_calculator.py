@@ -1,9 +1,3 @@
-"""
-Precision Farming Area Calculation Module (Corrected)
-
-Accurate, overlap-safe area calculation using geometric union.
-Grid logic is removed from final billing calculation.
-"""
 
 import math
 from dataclasses import dataclass
@@ -13,9 +7,9 @@ from shapely.geometry import LineString, Polygon
 from shapely.ops import unary_union
 
 
-# ============================================================================
+# =============================================================================
 # DATA STRUCTURES
-# ============================================================================
+# =============================================================================
 
 @dataclass
 class SensorRecord:
@@ -47,15 +41,19 @@ class CalculationResult:
     total_area_m2: float
     total_area_ha: float
     geometry: Polygon
+    quality_score: float  # 0.0 to 1.0
+    estimated_error_m2: float  # ±error in m²
+    working_trajectory_points: int  # Count of working-speed points
+    repositioning_points_filtered: int  # Count of high-speed (repositioning) points filtered out
 
 
-# ============================================================================
+# =============================================================================
 # COORDINATE CONVERSION
-# ============================================================================
+# =============================================================================
 
 def gps_to_planar(lat: float, lon: float,
                   origin_lat: float, origin_lon: float) -> Tuple[float, float]:
-    R = 6371000.0  # Earth radius (m)
+    R = 6371000.0
 
     lat_r = math.radians(lat)
     lon_r = math.radians(lon)
@@ -71,9 +69,129 @@ def gps_to_planar(lat: float, lon: float,
     return x, y
 
 
-# ============================================================================
-# FILTERING
-# ============================================================================
+# =============================================================================
+# FILTERING & SMOOTHING
+# =============================================================================
+
+def smooth_planar_points(points: List[PlanarPoint], window: int = 3) -> List[PlanarPoint]:
+    if len(points) < window:
+        return points
+
+    smoothed = []
+    for i in range(len(points)):
+        xs, ys = [], []
+        for j in range(max(0, i - window), min(len(points), i + window + 1)):
+            xs.append(points[j].x)
+            ys.append(points[j].y)
+
+        smoothed.append(
+            PlanarPoint(
+                x=sum(xs) / len(xs),
+                y=sum(ys) / len(ys),
+                speed_kmh=points[i].speed_kmh,
+                engine_on=points[i].engine_on,
+                pto_on=points[i].pto_on,
+            )
+        )
+    return smoothed
+
+
+def separate_trajectories_by_speed(points: List[PlanarPoint],
+                                    repositioning_speed_kmh: float = 15.0
+                                    ) -> Tuple[List[PlanarPoint], List[PlanarPoint]]:
+    """
+    Separate working trajectory from repositioning trajectory based on speed threshold.
+    
+    Real-world patterns:
+    - Working speed: 2-12 km/h (actively applying implement)
+    - Repositioning: > repositioning_speed_kmh (moving to next field/headland)
+    
+    Args:
+        points: All valid planar points
+        repositioning_speed_kmh: Speed threshold above which points are considered repositioning
+    
+    Returns:
+        (working_points, repositioning_points) — two separate trajectory lists
+    """
+    working = []
+    repositioning = []
+    
+    for point in points:
+        if point.speed_kmh >= repositioning_speed_kmh:
+            repositioning.append(point)
+        else:
+            working.append(point)
+    
+    return working, repositioning
+
+
+def calculate_quality_metrics(valid_points: List[PlanarPoint],
+                              working_points: List[PlanarPoint],
+                              repositioning_count: int,
+                              area_m2: float
+                              ) -> Tuple[float, float]:
+    """
+    Calculate GPS quality score and estimated error bounds.
+    
+    Quality factors:
+    1. Data density: points per 100m of travel
+    2. Working trajectory ratio: % of points at working speed
+    3. Speed consistency: std dev of working speeds
+    4. GPS fix confidence: lower repositioning ratio = better confidence in working area
+    
+    Returns:
+        (quality_score: 0.0-1.0, estimated_error_m2: ±meters²)
+    """
+    if not working_points or not valid_points:
+        return 0.0, area_m2 * 0.5  # Low confidence
+    
+    # Factor 1: Data density (normalized)
+    total_distance = 0.0
+    for i in range(len(working_points) - 1):
+        dx = working_points[i + 1].x - working_points[i].x
+        dy = working_points[i + 1].y - working_points[i].y
+        total_distance += math.hypot(dx, dy)
+    
+    points_per_100m = (len(working_points) / max(total_distance, 100.0)) * 100.0
+    density_score = min(points_per_100m / 20.0, 1.0)  # 20+ points per 100m = perfect
+    
+    # Factor 2: Working trajectory ratio
+    working_ratio = len(working_points) / max(len(valid_points), 1)
+    working_ratio_score = min(working_ratio, 1.0)
+    
+    # Factor 3: Speed consistency in working trajectory
+    if len(working_points) > 1:
+        working_speeds = [p.speed_kmh for p in working_points]
+        mean_speed = sum(working_speeds) / len(working_speeds)
+        variance = sum((s - mean_speed) ** 2 for s in working_speeds) / len(working_speeds)
+        std_dev = math.sqrt(variance)
+        speed_consistency = max(1.0 - (std_dev / max(mean_speed, 0.1)), 0.0)
+    else:
+        speed_consistency = 0.5
+    
+    # Factor 4: Repositioning filtering confidence
+    repositioning_ratio = repositioning_count / max(len(valid_points), 1)
+    repositioning_score = 1.0 - min(repositioning_ratio, 1.0)
+    
+    # Combined quality score (weighted average)
+    quality_score = (
+        density_score * 0.25 +
+        working_ratio_score * 0.30 +
+        speed_consistency * 0.25 +
+        repositioning_score * 0.20
+    )
+    
+    # Estimated error based on quality
+    # Assume standard GPS error ±5m for position, scales with data quality
+    gps_position_error_m = 5.0
+    implement_width_error_m = 0.5
+    
+    base_error = (gps_position_error_m + implement_width_error_m) * (1.0 - quality_score)
+    estimated_error_m2 = base_error * math.sqrt(area_m2 / 100.0)
+    
+    return quality_score, estimated_error_m2
+
+
 
 def filter_and_project(records: List[SensorRecord],
                        min_speed: float) -> List[PlanarPoint]:
@@ -92,16 +210,31 @@ def filter_and_project(records: List[SensorRecord],
         x, y = gps_to_planar(r.latitude, r.longitude, origin_lat, origin_lon)
         valid.append(PlanarPoint(x, y, r.speed_kmh, r.engine_on, r.pto_on))
 
-    return valid
+    return smooth_planar_points(valid)
 
 
-# ============================================================================
-# CORE GEOMETRIC LOGIC (FIXED)
-# ============================================================================
+# =============================================================================
+# GEOMETRIC CORE (HARDENED)
+# =============================================================================
 
-def build_work_polygons(points: List[PlanarPoint],
-                        implement_width_m: float) -> List[Polygon]:
+def heading(p1: PlanarPoint, p2: PlanarPoint) -> float:
+    return math.atan2(p2.y - p1.y, p2.x - p1.x)
 
+
+def is_heading_jitter(p_prev: PlanarPoint,
+                      p_curr: PlanarPoint,
+                      p_next: PlanarPoint,
+                      max_angle_rad: float = math.radians(45)) -> bool:
+    h1 = heading(p_prev, p_curr)
+    h2 = heading(p_curr, p_next)
+
+    diff = abs(h2 - h1)
+    diff = min(diff, 2 * math.pi - diff)
+
+    return diff > max_angle_rad
+
+
+def build_work_polygons(points, implement_width_m):
     polygons = []
 
     for i in range(len(points) - 1):
@@ -109,61 +242,109 @@ def build_work_polygons(points: List[PlanarPoint],
 
         distance = math.hypot(p2.x - p1.x, p2.y - p1.y)
 
-        # Ignore jitter
-        if distance < 0.3:
+        if distance < max(0.5, implement_width_m * 0.25):
             continue
 
-        # Ignore GPS gaps / teleportation
-        if distance > 20.0:
+        if distance > 25.0:
             continue
 
         line = LineString([(p1.x, p1.y), (p2.x, p2.y)])
-        strip = line.buffer(implement_width_m / 2.0, resolution=16)
+
+        strip = line.buffer(
+            implement_width_m / 2.0,
+            resolution=32,
+            cap_style=1,
+            join_style=1
+        )
 
         polygons.append(strip)
 
     return polygons
 
 
-# ============================================================================
+
+
+# =============================================================================
 # FINAL AREA CALCULATION
-# ============================================================================
+# =============================================================================
 
 def calculate_worked_area(records: List[SensorRecord],
                           config: CalculationConfig,
-                          field_boundary: Optional[Polygon] = None
+                          field_boundary: Optional[Polygon] = None,
+                          repositioning_speed_kmh: float = 15.0
                           ) -> CalculationResult:
 
     valid_points = filter_and_project(records, config.min_speed_kmh)
 
     if len(valid_points) < 2:
-        return CalculationResult(0.0, 0.0, Polygon())
+        return CalculationResult(
+            total_area_m2=0.0,
+            total_area_ha=0.0,
+            geometry=Polygon(),
+            quality_score=0.0,
+            estimated_error_m2=0.0,
+            working_trajectory_points=0,
+            repositioning_points_filtered=0
+        )
 
-    strips = build_work_polygons(valid_points, config.implement_width_m)
+    # Separate working vs repositioning trajectories
+    working_points, repositioning_points = separate_trajectories_by_speed(
+        valid_points, repositioning_speed_kmh
+    )
+
+    # Core calculation uses only working-speed points
+    if len(working_points) < 2:
+        return CalculationResult(
+            total_area_m2=0.0,
+            total_area_ha=0.0,
+            geometry=Polygon(),
+            quality_score=0.0,
+            estimated_error_m2=0.0,
+            working_trajectory_points=len(working_points),
+            repositioning_points_filtered=len(repositioning_points)
+        )
+
+    strips = build_work_polygons(working_points, config.implement_width_m)
 
     if not strips:
-        return CalculationResult(0.0, 0.0, Polygon())
+        return CalculationResult(
+            total_area_m2=0.0,
+            total_area_ha=0.0,
+            geometry=Polygon(),
+            quality_score=0.0,
+            estimated_error_m2=0.0,
+            working_trajectory_points=len(working_points),
+            repositioning_points_filtered=len(repositioning_points)
+        )
 
-    # 🔥 THIS IS THE CRITICAL FIX
-    merged_area = unary_union(strips)
+    merged = unary_union(strips).buffer(0)
 
-    # Optional clipping to field boundary
     if field_boundary:
-        merged_area = merged_area.intersection(field_boundary)
+        merged = merged.intersection(field_boundary)
 
-    total_area_m2 = merged_area.area
+    total_area_m2 = merged.area
     total_area_ha = total_area_m2 / 10000.0
+
+    # Calculate quality metrics
+    quality_score, estimated_error_m2 = calculate_quality_metrics(
+        valid_points, working_points, len(repositioning_points), total_area_m2
+    )
 
     return CalculationResult(
         total_area_m2=total_area_m2,
         total_area_ha=total_area_ha,
-        geometry=merged_area
+        geometry=merged,
+        quality_score=quality_score,
+        estimated_error_m2=estimated_error_m2,
+        working_trajectory_points=len(working_points),
+        repositioning_points_filtered=len(repositioning_points)
     )
 
 
-# ============================================================================
+
+# =============================================================================
 # MANUAL TEST
-# ============================================================================
+# =============================================================================
 
 def run_manual_test():
     points = [
@@ -176,8 +357,8 @@ def run_manual_test():
     strips = build_work_polygons(points, implement_width_m=4.0)
     merged = unary_union(strips)
 
-    print("Total area (m²):", merged.area)
-    print("Total area (ha):", merged.area / 10000)
+    print("Total area (m²):", round(merged.area, 2))
+    print("Total area (ha):", round(merged.area / 10000, 6))
 
 
 if __name__ == "__main__":
